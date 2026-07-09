@@ -194,7 +194,7 @@ async function processVideo(srcPath, needThumbnails, needVideo) {
     for(const thumbType in thumbs) {
         const maxSize = thumbs[thumbType];
         const scale = landscape ? `'-2:min(${maxSize},ih)'` : `'min(${maxSize},iw):-2'`;
-        let newPath = srcPath.replace(/\..+$/, '')+'-'+thumbType;
+        let newPath = srcPath.replace(/\.[^/.]+$/, '')+'-'+thumbType;
         
         if(thumbType != 'film_h264') {
             newPath += '.jpg';
@@ -221,8 +221,8 @@ async function processImage(srcPath) {
 
     for(const thumbType in thumbs) {
         const maxSize = thumbs[thumbType];
-        let newPath = srcPath.replace(/\..+$/, '')+'-'+thumbType+'.jpg';
-        await executeCommand('magick', ['convert', srcPath, '-resize', maxSize+'<^', newPath]);
+        let newPath = srcPath.replace(/\.[^/.]+$/, '')+'-'+thumbType+'.jpg';
+        await executeCommand('magick', ['convert', srcPath, '-auto-orient', '-resize', `${maxSize}x${maxSize}^>`, '-strip', newPath]);
         thumbs[thumbType] = newPath;
     }
     return thumbs;
@@ -248,10 +248,11 @@ function readLine(prompt) {
 }
 
 
-(async () => {
-    if(!fs.existsSync('tmp')) {
-        fs.mkdirSync('tmp');
-    }
+if (require.main === module) {
+    (async () => {
+        if(!fs.existsSync('tmp')) {
+            fs.mkdirSync('tmp');
+        }
 
     try {
         for(const account of config.accounts) {
@@ -315,4 +316,7 @@ function readLine(prompt) {
     files.forEach(file => {
         fs.unlinkSync('tmp/'+file);
     });
-})();
+    })();
+}
+
+module.exports = { processImage };
