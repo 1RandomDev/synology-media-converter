@@ -1,14 +1,29 @@
 const fs = require('fs');
 const readline = require('readline');
-const { Readable } = require('stream');
-const { finished } = require('stream/promises');
 const childProcess = require('child_process');
-const axios = require('axios');
+const { downloadFile } = require('./download-file');
+const { acquireInstanceLock } = require('./instance-lock');
+const {
+    SynologyApiError,
+    fetchJsonWithRetry
+} = require('./http-retry');
+const { uploadFiles } = require('./upload-files');
+const {
+    fastVideoThumbnailArgs,
+    fullVaapiVideoArgs,
+    softwareVideoArgs,
+    vaapiEncodeVideoArgs
+} = require('./video-conversion');
 const config = require('./config.json');
+
+const videoThumbnailStrategy = process.env.VIDEO_THUMBNAIL_STRATEGY ?? 'best';
+if(!['best', 'fast'].includes(videoThumbnailStrategy)) {
+    throw new Error(`Invalid VIDEO_THUMBNAIL_STRATEGY "${videoThumbnailStrategy}"; expected "best" or "fast".`);
+}
 
 async function login(account) {
     const session = { url: account.url };
-    let res = await fetch(account.url+'/webapi/entry.cgi', {
+    const res = await fetchJsonWithRetry(account.url+'/webapi/entry.cgi', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/x-www-form-urlencoded'
@@ -26,14 +41,13 @@ async function login(account) {
             passwd: account.password,
             otp_code: account.otpCode || ''
         })
-    });
-    res = await res.json();
+    }, 'Login');
     if(!res.success) {
         if(res.error.code == 403) {
             session.requireOtp = true;
             return session;
         } else {
-            throw new Error('Authentication failed with error '+JSON.stringify(res.error));
+            throw new SynologyApiError('Authentication failed', res.error);
         }
     }
 
@@ -44,7 +58,7 @@ async function login(account) {
 }
 
 async function checkConversionNeeded(session) {
-    let res = await fetch(session.url+'/webapi/entry.cgi', {
+    const res = await fetchJsonWithRetry(session.url+'/webapi/entry.cgi', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -58,75 +72,9 @@ async function checkConversionNeeded(session) {
             type: '["photo","video","live_video"]',
             preset: 'windows'
         })
-    });
-    res = await res.json();
-    if(!res.success) throw new Error('Requesting conversion needed failed with error '+JSON.stringify(res.error));
+    }, 'Conversion list request');
+    if(!res.success) throw new SynologyApiError('Requesting conversion needed failed', res.error);
     return res.data.list;
-}
-
-async function downloadFile(session, unitId, savePath) {
-    let res = await fetch(session.url+'/webapi/entry.cgi?'+new URLSearchParams({
-        api: 'SYNO.Foto.Download',
-        version: 1,
-        method: 'download',
-        unit_id: '['+unitId+']'
-    }), {
-        headers: {
-            'X-Syno-Token': session.synoToken,
-            'Cookie': `did=${session.did}; id=${session.sid}`
-        }
-    });
-    if(res.headers.get("content-type").includes('json')) {
-        res = await res.json();
-        if(!res.success) throw new Error(`Download of file ${unitId} failed with error `+JSON.stringify(res.error));
-    } else {
-        const fileStream = fs.createWriteStream(savePath, { flags: 'w' });
-        await finished(Readable.fromWeb(res.body).pipe(fileStream));
-    }
-}
-
-/*async function uploadFiles(session, unitId, filePaths) {
-    // Upload fails due to bug in Fetch API or built in FormData
-    const form = new FormData();
-    form.set('api', 'SYNO.Foto.Upload.ConvertedFile');
-    form.set('version', '3');
-    form.set('method', 'upload');
-    form.set('unit_id', unitId);
-    for(const name in filePaths) {
-        const path = filePaths[name];
-        form.set(name, fs.createReadStream(path));
-    }
-
-    let res = await fetch(session.url+'/webapi/entry.cgi', {
-        method: 'POST',
-        headers: {
-            'X-Syno-Token': session.synoToken,
-            'Cookie': `did=${session.did}; id=${session.sid}`
-        },
-        body: form
-    });
-    res = await res.json();
-    console.log(res)
-    if(!res.success) throw new Error(`Upload of file ${unitId} failed with error `+JSON.stringify(res.error));
-}*/
-async function uploadFiles(session, unitId, filePaths) {
-    const form = {
-        api: 'SYNO.Foto.Upload.ConvertedFile',
-        version: 3,
-        method: 'upload',
-        unit_id: unitId
-    };
-    for(const name in filePaths) {
-        const path = filePaths[name];
-        form[name] = fs.createReadStream(path);
-    }
-    const res = await axios.postForm(session.url+'/webapi/entry.cgi', form, {
-        headers: {
-            'X-Syno-Token': session.synoToken,
-            'Cookie': `did=${session.did}; id=${session.sid}`
-        }
-    });
-    if(!res.data.success) throw new Error(`Upload of file ${unitId} failed with error `+JSON.stringify(res.data.error));
 }
 
 async function setBroken(session, unitId) {
@@ -134,7 +82,7 @@ async function setBroken(session, unitId) {
         throw new Error('Exit on broken file is enabled.');
     }
 
-    let res = await fetch(session.url+'/webapi/entry.cgi?'+new URLSearchParams({
+    const res = await fetchJsonWithRetry(session.url+'/webapi/entry.cgi?'+new URLSearchParams({
         api: 'SYNO.Foto.Upload.ConvertedFile',
         version: 3,
         method: 'set_broken',
@@ -145,9 +93,10 @@ async function setBroken(session, unitId) {
             'X-Syno-Token': session.synoToken,
             'Cookie': `did=${session.did}; id=${session.sid}`
         }
-    });
-    res = await res.json();
-    if(!res.success) throw new Error(`Marking file ${unitId} as broken failed with error `+JSON.stringify(res.error));
+    }, `Marking file ${unitId} as broken`);
+    if(!res.success) {
+        throw new SynologyApiError(`Marking file ${unitId} as broken failed`, res.error);
+    }
 }
 
 function executeCommand(cmd, args) {
@@ -191,23 +140,59 @@ async function processVideo(srcPath, needThumbnails, needVideo) {
         thumbs['thumb_m'] = 320;
         thumbs['thumb_xl'] = 1280;
     }
-    for(const thumbType in thumbs) {
-        const maxSize = thumbs[thumbType];
-        const scale = landscape ? `'-2:min(${maxSize},ih)'` : `'min(${maxSize},iw):-2'`;
-        let newPath = srcPath.replace(/\..+$/, '')+'-'+thumbType;
-        
-        if(thumbType != 'film_h264') {
-            newPath += '.jpg';
-            await executeCommand('ffmpeg', ['-v', 'error', '-y', '-i', srcPath, '-filter:v', 'thumbnail,scale='+scale, '-frames:v', '1', newPath]);
-        } else {
-            newPath += '.mp4';
-            if(process.env.USE_VAAPI == 'true') {
-                await executeCommand('ffmpeg', ['-v', 'error', '-y', '-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi', '-i', srcPath, '-filter:v', 'scale_vaapi='+scale, '-c:v', 'h264_vaapi', '-preset', 'slow', newPath]);
+    const fastThumbnailPath = srcPath.replace(/\..+$/, '')+'-thumbnail-source.jpg';
+    let fastThumbnailCreated = false;
+    try {
+        for(const thumbType in thumbs) {
+            const maxSize = thumbs[thumbType];
+            const scale = landscape ? `'-2:min(${maxSize},ih)'` : `'min(${maxSize},iw):-2'`;
+            let newPath = srcPath.replace(/\..+$/, '')+'-'+thumbType;
+
+            if(thumbType != 'film_h264') {
+                newPath += '.jpg';
+                if(videoThumbnailStrategy == 'fast') {
+                    if(!fastThumbnailCreated) {
+                        await executeCommand('ffmpeg', fastVideoThumbnailArgs(srcPath, fastThumbnailPath));
+                        fastThumbnailCreated = true;
+                    }
+                    await executeCommand('magick', ['convert', fastThumbnailPath, '-resize', `${maxSize}x${maxSize}^>`, newPath]);
+                } else {
+                    await executeCommand('ffmpeg', ['-v', 'error', '-y', '-i', srcPath, '-filter:v', 'thumbnail,scale='+scale, '-frames:v', '1', newPath]);
+                }
             } else {
-                await executeCommand('ffmpeg', ['-v', 'error', '-y', '-i', srcPath, '-filter:v', 'scale='+scale, '-c:v', 'h264', '-preset', 'slow', newPath]);
+                newPath += '.mp4';
+                let convertedWithVaapi = false;
+                if(process.env.USE_VAAPI == 'true') {
+                    try {
+                        await executeCommand('ffmpeg', fullVaapiVideoArgs(srcPath, scale, newPath));
+                        convertedWithVaapi = true;
+                    } catch(err) {
+                        console.warn('Full VAAPI conversion failed; retrying with software decoding:', err.message);
+                        await fs.promises.rm(newPath, { force: true });
+                    }
+
+                    if(!convertedWithVaapi) {
+                        try {
+                            // Some common camera formats (for example HEVC 10-bit 4:2:2)
+                            // cannot be decoded by older VAAPI devices. Decode and apply
+                            // autorotation in software, then upload frames for accelerated
+                            // scaling and H.264 encoding.
+                            await executeCommand('ffmpeg', vaapiEncodeVideoArgs(srcPath, scale, newPath));
+                            convertedWithVaapi = true;
+                        } catch(err) {
+                            console.warn('VAAPI encoding failed; retrying with software encoding:', err.message);
+                            await fs.promises.rm(newPath, { force: true });
+                        }
+                    }
+                }
+                if(!convertedWithVaapi) {
+                    await executeCommand('ffmpeg', softwareVideoArgs(srcPath, scale, newPath));
+                }
             }
+            thumbs[thumbType] = newPath;
         }
-        thumbs[thumbType] = newPath;
+    } finally {
+        await fs.promises.rm(fastThumbnailPath, { force: true });
     }
     return thumbs;
 }
@@ -249,6 +234,12 @@ function readLine(prompt) {
 
 
 (async () => {
+    const instanceLock = await acquireInstanceLock();
+    if(!instanceLock) {
+        console.log('Another converter instance is already running, exiting');
+        return;
+    }
+
     if(!fs.existsSync('tmp')) {
         fs.mkdirSync('tmp');
     }

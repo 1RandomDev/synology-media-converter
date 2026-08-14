@@ -15,11 +15,12 @@ You can easily install the service via the [Container manager](https://www.synol
 docker run -d --name=synology-media-converter \
     --network=host \
     -v <config_file>:/app/config.json \
-    -e TZ=<timezone>
+    -e TZ=<timezone> \
     -e CRON_INTERVAL="0 1 * * *" \
     -e USE_VAAPI=true \
+    -e VIDEO_THUMBNAIL_STRATEGY=best \
     --device /dev/dri/renderD128 \
-    ghcr.io/1randomdev/synology-media-converter
+    ghcr.io/1randomdev/synology-media-converter:latest
 ```
 
 ## Configuration
@@ -50,6 +51,18 @@ Example config for 2 users on the same device:
 | SINGLE_RUN | Only run the script once instead of using cron. Auto restart of the container must be disabled. | false |
 | EXIT_ON_FAIL | Exit on conversion errors instead of permanently marking the affected file as broken. Usually only used for testing purposes. | false |
 | USE_VAAPI | Enable hardware acceleration via VAAPI. For more info see [Hardware Acceleration](#hardware-acceleration). | false |
+| VIDEO_THUMBNAIL_STRATEGY | Video thumbnail selection strategy. `best` uses FFmpeg's representative-frame filter; `fast` extracts the first frame once and derives every requested size from it, substantially reducing memory use for high-resolution videos. | `best` |
+| API_TIMEOUT_MS | Timeout for login and API requests in milliseconds. | `30000` |
+| TRANSFER_TIMEOUT_MS | Timeout for each media download or upload attempt in milliseconds. | `1800000` |
+| HTTP_RETRIES | Number of retries after a transient HTTP or network failure. | `3` |
+| RETRY_BASE_DELAY_MS | Initial retry backoff in milliseconds. Each retry doubles it before jitter. | `1000` |
+| RETRY_MAX_DELAY_MS | Maximum retry backoff in milliseconds. | `30000` |
 
-## Hardare Acceleration
-Hardware transcoding to x264 is currently supported on Intel and AMD Graphics using VAAPI, which is what's available on most DiskStation models. To enable hardware acceleration add the environment variable `USE_VAAPI=true` and pass through the VAAPI device via `--device /dev/dri/renderD128`. The right permissions will be set automatically on startup.
+## Single-instance execution
+
+The converter prevents overlapping runs by holding an abstract Unix socket on Linux. This is the path used on Synology and in the Docker image, and the kernel automatically releases the lock when the process exits or crashes.
+
+When running the Node.js process directly on a non-Linux development system (eg. macOS), the lock falls back to a filesystem socket named `synology-media-converter.sock` in the operating system's temporary directory. An abnormal termination may leave that socket behind. If the converter reports that another instance is running when none is active, remove the stale socket from the temporary directory before restarting it.
+
+## Hardware Acceleration
+Hardware transcoding to x264 is currently supported on Intel and AMD Graphics using VAAPI, which is what's available on most DiskStation models. To enable hardware acceleration add the environment variable `USE_VAAPI=true` and pass through the VAAPI device via `--device /dev/dri/renderD128`. The app first attempts fully accelerated decoding, scaling, and encoding. If the device cannot decode the source format, it retries with software decoding and accelerated scaling and encoding. If VAAPI still fails, it retries with fully software conversion. The right permissions will be set automatically on startup.

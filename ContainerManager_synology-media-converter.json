@@ -15,6 +15,30 @@
       {
          "key" : "USE_VAAPI",
          "value" : "true"
+      },
+      {
+         "key" : "VIDEO_THUMBNAIL_STRATEGY",
+         "value" : "best"
+      },
+      {
+         "key" : "API_TIMEOUT_MS",
+         "value" : "30000"
+      },
+      {
+         "key" : "TRANSFER_TIMEOUT_MS",
+         "value" : "1800000"
+      },
+      {
+         "key" : "HTTP_RETRIES",
+         "value" : "3"
+      },
+      {
+         "key" : "RETRY_BASE_DELAY_MS",
+         "value" : "1000"
+      },
+      {
+         "key" : "RETRY_MAX_DELAY_MS",
+         "value" : "30000"
       }
    ],
    "exporting" : false,
